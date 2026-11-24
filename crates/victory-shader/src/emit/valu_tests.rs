@@ -166,6 +166,11 @@ fn run_cases(
     cases: &[[u32; 4]],
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
+    // One test at a time: with these tests on the hardware adapter and WARP
+    // from several test threads at once, now and then none of their
+    // dispatches ever completes and the test binary hangs.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
@@ -277,6 +282,32 @@ fn v_med3_f32_matches_rdna2_with_nan() {
             ),
         }
     });
+}
+
+/// RDNA2 orders -0 below +0 in its maximums and minimums; DXIL's FMax and
+/// FMin compare and select, which can give either zero.
+#[test]
+fn max_and_min_order_negative_zero_below_positive_zero() {
+    let (pz, nz) = (0_u32, 0x8000_0000_u32);
+    // Each case has a -0 and a +0 among its first two operands.
+    let cases = [
+        [nz, pz, nz, 0],
+        [pz, nz, nz, 0],
+        [nz, pz, pz, 0],
+        [pz, nz, pz, 0],
+    ];
+    let ops = [
+        ("v_max_f32", 0x110, pz),
+        ("v_min_f32", 0x10F, nz),
+        ("v_max3_f32", 0x154, pz),
+        ("v_min3_f32", 0x151, nz),
+    ];
+    for (name, op, want) in ops {
+        let shader = build_valu_cs(&vop3(op, 0, vgpr(1), vgpr(2), vgpr(3)));
+        run_cases(&shader, &cases, |backend, _, inp, got| {
+            assert_eq!(got, want, "{backend}: {name} {inp:x?}");
+        });
+    }
 }
 
 #[test]
