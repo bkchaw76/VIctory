@@ -1,0 +1,41 @@
+
+name: Build VIctory Windows x64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --target x86_64-pc-windows-msvc
+          rustc --version
+
+      - name: Build VIctory Release
+        shell: pwsh
+        run: cargo build --release -p victory --locked
+
+      - name: Prepare executable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist
+          Copy-Item target/release/victory.exe dist/
+          Copy-Item victory.example.toml dist/
+
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: VIctory-Windows-x64
+          path: dist/
+          if-no-files-found: error
