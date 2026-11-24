@@ -4255,6 +4255,8 @@ impl<'a> Lower<'a> {
             "v_min_i16",
             "v_cvt_u16_f16",
             "v_cvt_i16_f16",
+            "v_cvt_norm_i16_f16",
+            "v_cvt_norm_u16_f16",
         ];
         let all = [FLOAT1, FLOAT2, FLOAT3, INT];
         if !all.iter().any(|l| l.contains(&name))
@@ -4393,21 +4395,35 @@ impl<'a> Lower<'a> {
             };
             return float_result(self, r);
         }
+        if matches!(name, "v_cvt_norm_i16_f16" | "v_cvt_norm_u16_f16") {
+            if v.clamp || v.omod != 0 {
+                return Err("modifiers on a 16-bit integer operation");
+            }
+            let r = self.cvt_norm16(inst, name == "v_cvt_norm_i16_f16")?;
+            return self.write_half(inst, r, guard);
+        }
         // 16-bit integers: computed on the low halves, the low 16 bits kept.
         if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = match name {
             "v_cvt_u16_f16" | "v_cvt_i16_f16" => {
-                // shortcut: converted through 32 bits, so out-of-range values
-                // wrap instead of saturating at 16 bits.
+                // Toward zero, saturating at the 16-bit range (infinities
+                // included); NaN gives 0. Clamped in f32 first, where every
+                // f16 is exact, so the conversion never leaves i32's range.
                 let a = self.half_fsrc(inst, 0)?;
-                let op = if name == "v_cvt_u16_f16" {
-                    Cast::FpToUi
+                let (lo, hi) = if name == "v_cvt_u16_f16" {
+                    (0.0f32, 65535.0f32)
                 } else {
-                    Cast::FpToSi
+                    (-32768.0, 32767.0)
                 };
-                self.s.m.cast(c, op, a, i32t)
+                let (lo, hi) = (self.s.m.f32(lo.to_bits()), self.s.m.f32(hi.to_bits()));
+                let t = self.binary(35, a, lo);
+                let t = self.binary(36, t, hi);
+                let r = self.s.m.cast(c, Cast::FpToSi, t, i32t);
+                let nan = self.s.m.cmp(c, pred::UNO, a, a);
+                let z = self.s.m.i32(0);
+                self.s.m.select(c, nan, z, r)
             }
             _ => {
                 let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
@@ -4455,6 +4471,78 @@ impl<'a> Lower<'a> {
             }
         };
         self.write_half(inst, r, guard)
+    }
+
+    /// `v_cvt_norm_i16_f16` / `v_cvt_norm_u16_f16`: the f16 source (with its
+    /// abs/neg modifiers) clamped to [-1, 1] or [0, 1], times 32767 or 65535,
+    /// rounded to nearest even once from the exact product; NaN gives 0.
+    /// Worked on the f16's bits in integers, because in f32 the product
+    /// (up to 26 significant bits) would round before the rounding to an
+    /// integer.
+    fn cvt_norm16(&mut self, inst: &Inst, signed: bool) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let c = self.cur;
+        let k = |l: &mut Self, x: u32| l.s.m.i32(x);
+        let mut h = self.half_src(inst, 0)?;
+        if v.abs & 1 != 0 {
+            let m = k(self, 0x7FFF);
+            h = self.s.m.bin(c, Bin::And, h, m);
+        }
+        if v.neg & 1 != 0 {
+            let m = k(self, 0x8000);
+            h = self.s.m.bin(c, Bin::Xor, h, m);
+        }
+        let scale = if signed { 0x7FFF } else { 0xFFFF };
+        let (k0, k1, k10) = (k(self, 0), k(self, 1), k(self, 10));
+        let mag_mask = k(self, 0x7FFF);
+        let mag = self.s.m.bin(c, Bin::And, h, mag_mask);
+        let k15 = k(self, 15);
+        let neg = self.s.m.bin(c, Bin::LShr, h, k15);
+        let neg = self.s.m.cmp(c, pred::NE, neg, k0);
+        // |x| < 1: x = m * 2^-s with m < 2^11 and 11 <= s <= 24.
+        let exp = self.s.m.bin(c, Bin::LShr, mag, k10);
+        let man_mask = k(self, 0x3FF);
+        let man = self.s.m.bin(c, Bin::And, mag, man_mask);
+        let implicit = k(self, 0x400);
+        let normal = self.s.m.bin(c, Bin::Or, man, implicit);
+        let sub = self.s.m.cmp(c, pred::EQ, exp, k0);
+        let m = self.s.m.select(c, sub, man, normal);
+        let k25 = k(self, 25);
+        let s_norm = self.s.m.bin(c, Bin::Sub, k25, exp);
+        let k24 = k(self, 24);
+        let sh = self.s.m.select(c, sub, k24, s_norm);
+        let ks = k(self, scale);
+        let p = self.s.m.bin(c, Bin::Mul, m, ks);
+        let q = self.s.m.bin(c, Bin::LShr, p, sh);
+        let one_s = self.s.m.bin(c, Bin::Shl, k1, sh);
+        let low_mask = self.s.m.bin(c, Bin::Sub, one_s, k1);
+        let rem = self.s.m.bin(c, Bin::And, p, low_mask);
+        let half = self.s.m.bin(c, Bin::LShr, one_s, k1);
+        let above = self.s.m.cmp(c, pred::IUGT, rem, half);
+        let tie = self.s.m.cmp(c, pred::EQ, rem, half);
+        let odd = self.s.m.bin(c, Bin::And, q, k1);
+        let odd = self.s.m.cmp(c, pred::NE, odd, k0);
+        let tie_up = self.s.m.bin(c, Bin::And, tie, odd);
+        let up = self.s.m.bin(c, Bin::Or, above, tie_up);
+        let r = self.s.m.select(c, up, k1, k0);
+        let r = self.s.m.bin(c, Bin::Add, q, r);
+        // |x| >= 1 (and infinity) saturates; NaN gives 0.
+        let one_h = k(self, 0x3C00);
+        let big = self.s.m.cmp(c, pred::IUGE, mag, one_h);
+        let r = self.s.m.select(c, big, ks, r);
+        let inf = k(self, 0x7C00);
+        let nan = self.s.m.cmp(c, pred::IUGT, mag, inf);
+        let r = self.s.m.select(c, nan, k0, r);
+        let r = if signed {
+            let n = self.s.m.bin(c, Bin::Sub, k0, r);
+            self.s.m.select(c, neg, n, r)
+        } else {
+            self.s.m.select(c, neg, k0, r)
+        };
+        let m16 = k(self, 0xFFFF);
+        Ok(self.s.m.bin(c, Bin::And, r, m16))
     }
 
     /// Half `high` of source `k` of a packed (VOP3P) operation, in the low
@@ -4812,24 +4900,22 @@ impl<'a> Lower<'a> {
                     _ => {
                         // A computed selector: each byte picked at run time.
                         let (a, b, sv) = (s(self, 0)?, s(self, 1)?, s(self, 2)?);
-                        let i64t = self.s.m.int(64);
-                        self.s.flags |= flags::INT64;
-                        let wa = self.s.m.cast(c, Cast::ZExt, a, i64t);
-                        let wb = self.s.m.cast(c, Cast::ZExt, b, i64t);
-                        let k32 = self.s.m.int_const(i64t, 32);
-                        let wa = self.s.m.bin(c, Bin::Shl, wa, k32);
-                        let both = self.s.m.bin(c, Bin::Or, wa, wb);
                         let mut r = k(self, 0);
                         for i in 0..4u32 {
                             let (sh, ff) = (k(self, 8 * i), k(self, 0xFF));
                             let sel = self.s.m.bin(c, Bin::LShr, sv, sh);
                             let sel = self.s.m.bin(c, Bin::And, sel, ff);
-                            // Bytes 0-7 of {src0, src1}.
-                            let k3 = k(self, 3);
-                            let bits = self.s.m.bin(c, Bin::Shl, sel, k3);
-                            let bits = self.s.m.cast(c, Cast::ZExt, bits, i64t);
-                            let x = self.s.m.bin(c, Bin::LShr, both, bits);
-                            let x = self.s.m.cast(c, Cast::Trunc, x, self.s.t.i32);
+                            // Select a dword and a byte within it.
+                            // Later selects handle codes 8 and above.
+                            let four = k(self, 4);
+                            let zero = k(self, 0);
+                            let high = self.s.m.bin(c, Bin::And, sel, four);
+                            let high = self.s.m.cmp(c, pred::NE, high, zero);
+                            let word = self.s.m.select(c, high, a, b);
+                            let three = k(self, 3);
+                            let index = self.s.m.bin(c, Bin::And, sel, three);
+                            let bits = self.s.m.bin(c, Bin::Shl, index, three);
+                            let x = self.s.m.bin(c, Bin::LShr, word, bits);
                             let mut byte = self.s.m.bin(c, Bin::And, x, ff);
                             // 8-11: the sign of bytes 1, 3 of src1, then of src0.
                             for (n, src, bit) in [(8, b, 15), (9, b, 31), (10, a, 15), (11, a, 31)]
@@ -6692,6 +6778,89 @@ mod tests {
         for words in [add, sub] {
             lowers(&words).unwrap();
         }
+    }
+
+
+    fn perm_features(selector: u32) -> u64 {
+        // Synthetic compute shader:
+        // v0 is the thread ID and can supply a dynamic selector.
+        // Store the result in LDS to keep the permutation live.
+        let words = [
+            0x7E02_02FFu32,
+            0x817F_34AB,
+            0x7E04_02FF,
+            0xFE01_56CD,
+            0xD744_0003,
+            257 | (258 << 9) | (selector << 18),
+            0x3408_0082,
+            0xD834_0000,
+            0x0000_0304,
+            S_ENDPGM,
+        ];
+
+        let code: Vec<u8> = words.iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect();
+
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 256,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15,
+                threads: [64, 1, 1],
+            }),
+            code,
+        };
+
+        let p = ir::build(&native.code, false, 256).unwrap();
+
+        assert!(p.blocks.iter()
+            .flat_map(|b| &b.insts)
+            .any(|i| i.name() == "v_perm_b32"));
+
+        let res = resource::track(
+            &p, &native.layout, native.stage
+        ).unwrap();
+
+        let io = io::raise(&p, &native).unwrap();
+        let st = structure::structure(&p).unwrap();
+
+        let emitted = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        }).unwrap();
+
+        let container =
+            crate::Container::parse(&emitted.dxil).unwrap();
+
+        let features =
+            container.part(crate::FourCC::SFI0).unwrap();
+
+        u64::from_le_bytes(features.data.try_into().unwrap())
+    }
+
+    #[test]
+    fn perm_constant_selector_needs_no_int64() {
+        assert_eq!(perm_features(128) & 0x8000, 0);
+    }
+
+    #[test]
+    fn perm_dynamic_selector_needs_no_int64() {
+        assert_eq!(
+            perm_features(256) & 0x8000,
+            0,
+            "dynamic v_perm_b32 must not require INT64"
+        );
     }
 
     #[test]
